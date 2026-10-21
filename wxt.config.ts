@@ -1,0 +1,235 @@
+import path from "node:path"
+import process from "node:process"
+import ViteYaml from "@modyfi/vite-plugin-yaml"
+import { defineConfig } from "wxt"
+import { z } from "zod"
+import {
+  createExtensionClientEnvSchema,
+  isLocalPackagesEnabled,
+  LOCAL_PACKAGES_DEDUPE,
+  resolveExtensionEnv,
+} from "./src/env/shared"
+
+const WXT_API_KEY_PATTERN = /^WXT_.*API_KEY/
+// entrypoints/content-runtime, the ES module behind every page's content scripts
+const CONTENT_RUNTIME_NAME = "content-runtime"
+// Personal fork: intentionally bundles the user's own DeepSeek key (loaded from
+// the gitignored .env) so the self-built extension works out of the box. Never
+// publish a zip built from this fork. Upstream keeps only the analytics key.
+const ALLOWED_BUNDLED_API_KEYS = new Set(["WXT_POSTHOG_API_KEY", "WXT_DEEPSEEK_API_KEY"])
+// Personal fork: load .env before this config is evaluated. wxt's own .env
+// loading happens too late for shouldSkipEnvValidation below (the plugin below
+// does see process.env keys from .env at buildStart, hence the allowlist above).
+try {
+  process.loadEnvFile()
+} catch {
+  // No .env file — plain upstream builds do not need one.
+}
+const useLocalPackages = isLocalPackagesEnabled(process.env)
+const shouldSkipEnvValidation = process.env.WXT_SKIP_ENV_VALIDATION === "true"
+// Root of the read-frog monorepo whose source is aliased in when developing
+// with local packages. Defaults to the sibling checkout; override with
+// WXT_MONOREPO_PATH to point at a git worktree (relative or absolute).
+const monorepoRoot = process.env.WXT_MONOREPO_PATH
+  ? path.resolve(process.env.WXT_MONOREPO_PATH)
+  : path.resolve(__dirname, "../read-frog-monorepo")
+
+// See https://wxt.dev/api/config.html
+export default defineConfig({
+  srcDir: "src",
+  imports: false,
+  modules: ["@wxt-dev/module-react", "@wxt-dev/i18n/module"],
+  manifestVersion: 3,
+  // WXT top level alias - will be automatically synced to tsconfig.json paths and Vite alias
+  alias: useLocalPackages
+    ? {
+        "@read-frog/definitions": path.resolve(monorepoRoot, "packages/definitions/src"),
+        "@read-frog/api-contract": path.resolve(monorepoRoot, "packages/api-contract/src"),
+        "@read-frog/layout-engine": path.resolve(monorepoRoot, "packages/layout-engine/src"),
+      }
+    : {},
+  manifest: ({ mode, browser }) => ({
+    name: "__MSG_extName__",
+    description: "__MSG_extDescription__",
+    default_locale: "en",
+    // Fixed extension ID for development
+    ...(mode === "development" &&
+      (browser === "chrome" || browser === "edge") && {
+        key: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAw2KhiXO2vySZtPu5pNSbyKhYavh8Be7gXmCZt8aJf6tQ/L3JK0qzL+3JSc/o20td3Jw+B2Dcw+EI93NAZr24xKnTNXQiJpuIuHb8xLXD0Ra/HrTVi4TJIhPdESogoG4uL6CD/F3TxfZJ2trX4Bt9cdAw1RGGeU+xU0g+YFfEka4ZUCpFAmTEw9H3/DU+nCp8yGaJWyiVgCTcFe38GZKEPt0iMJkTw956wz/iiafLx0pNG/RaztG9cAPoQOD2+SMFaeQ+b/G4OG17TYhzb09AhNBl6zSJ3jTKHSwuedCFwCce8Q/EchJfQZv71mjAE97bzwvkDYPCLj31Z5FE8HntMwIDAQAB",
+      }),
+    permissions: [
+      "storage",
+      // The glossary is the only user-authored, non-regenerable data the
+      // extension stores locally. Without this, IndexedDB is "best-effort" and
+      // the browser may evict it under disk pressure — fine for the translation
+      // caches, data loss for a term list the user typed by hand. It also lifts
+      // the 10 MB quota the 20,000-term cap would otherwise sit close to.
+      "unlimitedStorage",
+      "tabs",
+      "alarms",
+      "cookies",
+      "contextMenus",
+      "identity",
+      "scripting",
+      "webNavigation",
+      ...(browser !== "firefox" ? ["offscreen", "sidePanel"] : []),
+    ],
+    host_permissions: [
+      "*://*/*", // Required for scripting.executeScript in any frame
+    ],
+    // Allow images/SVGs referenced by content-script UI <img> tags to be loaded from
+    // moz-extension:// URLs on regular pages. Firefox enforces this more strictly.
+    web_accessible_resources: [
+      {
+        resources: ["assets/*.png", "assets/*.svg", "assets/*.webp"],
+        matches: ["*://*/*", "file:///*"],
+      },
+      // The shared content runtime the loader content script imports. Pages
+      // can request it too; the dynamic URL keeps it from a fixed address.
+      {
+        resources: [`${CONTENT_RUNTIME_NAME}.js`],
+        matches: ["*://*/*", "file:///*"],
+        use_dynamic_url: true,
+      },
+      // Its chunks can't have one: Chrome resolves a module's relative imports
+      // against the extension's static id, even when the module itself came
+      // from the dynamic URL. Their names change with their content.
+      {
+        resources: [`${CONTENT_RUNTIME_NAME}/*`],
+        matches: ["*://*/*", "file:///*"],
+      },
+    ],
+    // Firefox-specific settings for MV3
+    ...(browser === "firefox" && {
+      // Override default CSP to exclude `upgrade-insecure-requests` (Firefox MV3 default),
+      // which would upgrade custom provider HTTP URLs (e.g. LAN) to HTTPS.
+      content_security_policy: {
+        extension_pages: "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';",
+      },
+      browser_specific_settings: {
+        gecko: {
+          id: "{bd311a81-4530-4fcc-9178-74006155461b}",
+          strict_min_version: "140.0",
+          data_collection_permissions: {
+            required: ["none"],
+            optional: ["technicalAndInteraction"],
+          },
+        },
+      },
+    }),
+  }),
+  zip: {
+    includeSources: ["**/*", ".env.production"],
+    excludeSources: ["docs/**/*", "assets/**/*", "repos/**/*", "readmes/**/*"],
+  },
+  hooks: {
+    // With local packages the bundle holds @read-frog/layout-engine's readable
+    // source, which must never leave this machine.
+    "zip:start": () => {
+      if (useLocalPackages) throw new Error("Do not zip a build made with local packages")
+    },
+    "vite:build:extendConfig": (entrypoints, viteConfig) => {
+      const entrypoint = entrypoints.length === 1 ? entrypoints[0] : undefined
+      if (entrypoint?.type === "unlisted-script" && entrypoint.name === CONTENT_RUNTIME_NAME) {
+        // WXT builds every script as one IIFE. The content runtime is imported
+        // as an ES module instead, so it can leave code (such as the locales
+        // it doesn't use) in chunks that load when needed.
+        if (viteConfig.build?.lib) viteConfig.build.lib.formats = ["es"]
+        const output = viteConfig.build?.rollupOptions?.output
+        for (const outputOptions of Array.isArray(output) ? output : output ? [output] : []) {
+          outputOptions.chunkFileNames = `${CONTENT_RUNTIME_NAME}/[name]-[hash].js`
+          outputOptions.assetFileNames = "assets/[name]-[hash].[ext]"
+          // Vite keeps whitespace and pure annotations in ES library output for
+          // the bundlers that would consume it; nothing bundles this one again.
+          if (viteConfig.build?.minify !== false) {
+            outputOptions.minify = true
+            outputOptions.comments = false
+          }
+        }
+        return
+      }
+      if (entrypoint?.type !== "content-script") return
+
+      const output = viteConfig.build?.rollupOptions?.output
+      if (!output) return
+
+      for (const outputOptions of Array.isArray(output) ? output : [output]) {
+        outputOptions.assetFileNames = (assetInfo) =>
+          assetInfo.names.some((name) => name.endsWith(".css"))
+            ? `content-scripts/${entrypoint.name}.[ext]`
+            : "assets/[name]-[hash].[ext]"
+      }
+    },
+  },
+  dev: {
+    server: {
+      // Prefer 3333 over WXT's default 3000 while still allowing WXT to pick
+      // another open port when 3333 is already taken.
+      port: 3333,
+      strictPort: false,
+    },
+  },
+  vite: (configEnv) => ({
+    resolve: {
+      // CodeMirror breaks with "Unrecognized extension value in extension set"
+      // if the bundle contains more than one copy of these packages (#1782).
+      dedupe: [
+        "@codemirror/state",
+        "@codemirror/view",
+        "@codemirror/language",
+        "@codemirror/lint",
+        "@codemirror/autocomplete",
+        "@codemirror/search",
+        "@codemirror/commands",
+        "@lezer/common",
+        // @codemirror/lang-liquid's parser and highlighting share these with the other languages.
+        "@lezer/highlight",
+        "@lezer/lr",
+        ...(useLocalPackages ? LOCAL_PACKAGES_DEDUPE : []),
+      ],
+    },
+    plugins: [
+      // Lets the runtime i18next facade (src/utils/i18n) `import` the `src/locales/*.yml`
+      // files as JS objects so i18next can bundle them for runtime language switching.
+      //
+      // This does NOT replace `@wxt-dev/i18n/module` (still registered in `modules` above).
+      // That module reads the same .yml files via its own fs-based mechanism — a separate
+      // path from this Vite `import` — and is kept ONLY for two build-time jobs it still owns:
+      //   1. Emitting `_locales/*/messages.json`, which the browser uses to localize the
+      //      manifest `__MSG_extName__` / `__MSG_extDescription__` below. That is chosen by
+      //      the browser UI language at load time and is NOT runtime-switchable (platform
+      //      constraint), so it stays with @wxt-dev/i18n.
+      //   2. Generating the `#i18n` key types (.wxt/i18n/structure.d.ts) that the facade
+      //      reuses for autocomplete/type-checking at every `i18n.t('key')` call site.
+      // Runtime UI string lookup itself no longer goes through @wxt-dev/i18n.
+      ViteYaml(),
+      ...(configEnv.mode === "production"
+        ? [
+            {
+              name: "check-api-key-env",
+              buildStart() {
+                z.object(
+                  createExtensionClientEnvSchema(
+                    configEnv.mode === "production",
+                    shouldSkipEnvValidation,
+                  ),
+                ).parse(resolveExtensionEnv(process.env))
+
+                const apiKeyVars = Object.keys(process.env)
+                  .filter((key) => WXT_API_KEY_PATTERN.test(key))
+                  .filter((key) => !ALLOWED_BUNDLED_API_KEYS.has(key))
+
+                if (apiKeyVars.length > 0) {
+                  throw new Error(
+                    `\n\nFound WXT_*_API_KEY environment variables that may be bundled:\n` +
+                      `${apiKeyVars.map((k) => `   - ${k}`).join("\n")}\n\n` +
+                      `Please unset these variables before building for production.\n`,
+                  )
+                }
+              },
+            },
+          ]
+        : []),
+    ],
+  }),
+})
